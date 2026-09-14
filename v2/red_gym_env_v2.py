@@ -531,6 +531,9 @@ class RedGymEnv(Env):
     def get_game_state_reward(self, print_stats=False):
         # addresses from https://datacrystal.romhacking.net/wiki/Pok%C3%A9mon_Red/Blue:RAM_map
         # https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm
+        
+        in_battle = self.read_m(0xD057) != 0
+        
         state_scores = {
             "event": self.reward_scale * self.update_max_event_rew() * 4,
             "level": self.reward_scale * self.get_levels_reward() * 2,
@@ -542,6 +545,8 @@ class RedGymEnv(Env):
             "battle": self.reward_scale * (2 if in_battle else 0),
             "win": self.reward_scale * self.battle_won_count * 50
         }
+
+        self.last_in_battle = in_battle
         return state_scores
 
     def update_max_op_level(self):
