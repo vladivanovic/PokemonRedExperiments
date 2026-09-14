@@ -2,7 +2,8 @@
 
 ## Quick Start (V2)
 
-1. **Setup:** Ensure your `PokemonRed.gb` is in the root directory.
+1. **Prepare ROM:** Place your `PokemonRed.gb` (1MB) in the **root** directory of this repository. 
+   *(The sha1 sum should be `ea9bcae617fdf159b045185467ae58b2e4a48b9a`)*.
 2. **Install:**
    ```bash
    cd v2

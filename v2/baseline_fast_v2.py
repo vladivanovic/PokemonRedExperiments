@@ -6,7 +6,7 @@ from red_gym_env_v2 import RedGymEnv
 from stream_agent_wrapper import StreamWrapper
 from stable_baselines3 import PPO
 from stable_baselines3.common import env_checker
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 from tensorboard_callback import TensorboardCallback
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     
     print(f"Starting training with {args.num_cpu} CPUs, Watch mode: {args.watch}")
     
-    env = SubprocVecEnv([make_env(i, env_config, watch=args.watch) for i in range(args.num_cpu)])
+    env = DummyVecEnv([make_env(i, env_config, watch=args.watch) for i in range(args.num_cpu)])
     
     checkpoint_callback = CheckpointCallback(save_freq=ep_length//2, save_path=sess_path,
                                      name_prefix="poke")
