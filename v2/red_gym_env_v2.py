@@ -1,64 +1,105 @@
-import uuid
+from __future__ import annotations
+
 import json
+import logging
+import uuid
+from collections import deque
 from pathlib import Path
-import cv2
 
 import numpy as np
-from skimage.transform import downscale_local_mean
-import matplotlib.pyplot as plt
-from pyboy import PyBoy
-#from pyboy.logger import log_level
-import mediapy as media
 from einops import repeat
-
 from gymnasium import Env, spaces
+from pyboy import PyBoy
 from pyboy.utils import WindowEvent
+from skimage.transform import downscale_local_mean
 
-from global_map import local_to_global, GLOBAL_MAP_SHAPE
+from global_map import GLOBAL_MAP_SHAPE, local_to_global
 
-event_flags_start = 0xD747
-event_flags_end = 0xD87E # expand for SS Anne # old - 0xD7F6 
-museum_ticket = (0xD754, 0)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Memory map (Pokemon Red/Blue USA)
+# https://datacrystal.romhacking.net/wiki/Pokemon_Red/Blue:RAM_map
+# ---------------------------------------------------------------------------
+EVENT_FLAGS_START = 0xD747
+EVENT_FLAGS_END = 0xD87E          # exclusive; expanded to cover S.S. Anne
+MUSEUM_TICKET = (0xD754, 0)
+
+IN_BATTLE = 0xD057                # 0 none, 1 wild, 2 trainer
+ENEMY_MON_HP = 0xCFE6             # 2 bytes, big endian
+PARTY_COUNT = 0xD163
+PARTY_SPECIES = (0xD164, 0xD165, 0xD166, 0xD167, 0xD168, 0xD169)
+PARTY_LEVELS = (0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268)
+PARTY_HP = (0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248)
+PARTY_MAX_HP = (0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269)
+BADGES = 0xD356
+POKEDEX_OWNED = (0xD2F7, 0xD30A)  # 19 bytes of owned flags
+X_POS, Y_POS, MAP_N = 0xD362, 0xD361, 0xD35E
+REDS_HOUSE_2F = 38                # map id the game starts on
+
+# built-in on 3.10+; user is on 3.12
+def popcount(v: int) -> int:
+    return int(v).bit_count()
+
 
 class RedGymEnv(Env):
-    def __init__(self, config=None):
-        self.s_path = config["session_path"]
-        self.save_final_state = config["save_final_state"]
-        self.print_rewards = config["print_rewards"]
-        self.headless = config["headless"]
-        self.init_state = config["init_state"]
-        self.act_freq = config["action_freq"]
-        self.max_steps = config["max_steps"]
-        self.save_video = config["save_video"]
-        self.fast_video = config["fast_video"]
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 60}
+
+    def __init__(self, config=None, render_mode: str | None = "rgb_array"):
+        config = dict(config or {})
+
+        # ---- paths / io -----------------------------------------------------
+        self.s_path = Path(config.get("session_path", "sessions/default"))
+        self.s_path.mkdir(parents=True, exist_ok=True)
+        self.gb_path = config["gb_path"]                     # required
+        init_state = config.get("init_state")
+        self.init_state = Path(init_state) if init_state else None
+
+        # ---- run config -----------------------------------------------------
+        self.save_final_state = bool(config.get("save_final_state", False))
+        self.print_rewards = bool(config.get("print_rewards", False))
+        self.headless = bool(config.get("headless", True))
+        self.act_freq = int(config.get("action_freq", 24))
+        self.press_step = int(config.get("press_step", 8))
+        if self.act_freq <= self.press_step:
+            raise ValueError(
+                f"action_freq ({self.act_freq}) must exceed press_step ({self.press_step})"
+            )
+        self.max_steps = int(config.get("max_steps", 20480))
+        self.save_video = bool(config.get("save_video", False))
+        self.fast_video = bool(config.get("fast_video", True))
+        self.explore_weight = float(config.get("explore_weight", 1.0))
+        self.reward_scale = float(config.get("reward_scale", 1.0))
+        self.instance_id = str(config.get("instance_id", str(uuid.uuid4())[:8]))
+        self.render_mode = render_mode
+
+        # debug / logging knobs (off by default: these are hot-path expensive)
+        self.debug_events = bool(config.get("debug_events", False))
+        self.event_scan_freq = int(config.get("event_scan_freq", 1000))
+        self.stats_log_freq = int(config.get("stats_log_freq", 1))
+        self.stats_maxlen = int(config.get("stats_maxlen", 20000))
+
+        # state-bootstrap knobs (only used when init_state is missing/stale)
+        self.boot_max_frames = int(config.get("boot_max_frames", 12000))
+        self.boot_settle_frames = int(config.get("boot_settle_frames", 240))
+
         self.frame_stacks = 3
-        self.explore_weight = (
-            1 if "explore_weight" not in config else config["explore_weight"]
-        )
-        self.reward_scale = (
-            1 if "reward_scale" not in config else config["reward_scale"]
-        )
-        self.instance_id = (
-            str(uuid.uuid4())[:8]
-            if "instance_id" not in config
-            else config["instance_id"]
-        )
-        self.s_path.mkdir(exist_ok=True)
+        self.action_history_len = int(config.get("action_history_len", 3))
+        self.enc_freqs = 8
+        self.coords_pad = 12
+        self.output_shape = (72, 80, self.frame_stacks)
+        self.stuck_threshold = int(config.get("stuck_threshold", 600))
+
         self.full_frame_writer = None
         self.model_frame_writer = None
         self.map_frame_writer = None
         self.reset_count = 0
-        self.all_runs = []
 
         self.essential_map_locations = {
-            v:i for i,v in enumerate([
-                40, 0, 12, 1, 13, 51, 2, 54, 14, 59, 60, 61, 15, 3, 65
-            ])
+            v: i for i, v in enumerate(
+                [40, 0, 12, 1, 13, 51, 2, 54, 14, 59, 60, 61, 15, 3, 65]
+            )
         }
-
-        # Set this in SOME subclasses
-        self.metadata = {"render.modes": []}
-        self.reward_range = (0, 15000)
 
         self.valid_actions = [
             WindowEvent.PRESS_ARROW_DOWN,
@@ -69,7 +110,6 @@ class RedGymEnv(Env):
             WindowEvent.PRESS_BUTTON_B,
             WindowEvent.PRESS_BUTTON_START,
         ]
-
         self.release_actions = [
             WindowEvent.RELEASE_ARROW_DOWN,
             WindowEvent.RELEASE_ARROW_LEFT,
@@ -77,533 +117,556 @@ class RedGymEnv(Env):
             WindowEvent.RELEASE_ARROW_UP,
             WindowEvent.RELEASE_BUTTON_A,
             WindowEvent.RELEASE_BUTTON_B,
-            WindowEvent.RELEASE_BUTTON_START
+            WindowEvent.RELEASE_BUTTON_START,
         ]
 
-        # load event names (parsed from https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm)
-        with open("events.json") as f:
-            event_names = json.load(f)
-        self.event_names = event_names
+        self.event_names = self._load_event_names()
 
-        self.output_shape = (72, 80, self.frame_stacks)
-        self.coords_pad = 12
-
-        # Set these in ALL subclasses
         self.action_space = spaces.Discrete(len(self.valid_actions))
-        
-        self.enc_freqs = 8
+        self.reward_range = (-float("inf"), float("inf"))
+        self.observation_space = spaces.Dict({
+            "screens": spaces.Box(
+                low=0, high=255, shape=self.output_shape, dtype=np.uint8),
+            "health": spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "level": spaces.Box(
+                low=-1.0, high=1.0, shape=(self.enc_freqs,), dtype=np.float32),
+            "badges": spaces.MultiBinary(8),
+            "events": spaces.MultiBinary((EVENT_FLAGS_END - EVENT_FLAGS_START) * 8),
+            "map": spaces.Box(
+                low=0, high=255,
+                shape=(self.coords_pad * 4, self.coords_pad * 4, 1),
+                dtype=np.uint8),
+            "recent_actions": spaces.MultiDiscrete(
+                [len(self.valid_actions)] * self.action_history_len),
+        })
 
-        self.observation_space = spaces.Dict(
-            {
-                "screens": spaces.Box(low=0, high=255, shape=self.output_shape, dtype=np.uint8),
-                "health": spaces.Box(low=0, high=1),
-                "level": spaces.Box(low=-1, high=1, shape=(self.enc_freqs,)),
-                "badges": spaces.MultiBinary(8),
-                "events": spaces.MultiBinary((event_flags_end - event_flags_start) * 8),
-                "map": spaces.Box(low=0, high=255, shape=(
-                    self.coords_pad*4,self.coords_pad*4, 1), dtype=np.uint8),
-                "recent_actions": spaces.MultiDiscrete([len(self.valid_actions)] * self.frame_stacks)
-            }
-        )
+        self.pyboy = None
+        self._start_emulator()
 
-        head = "null" if config["headless"] else "SDL2"
+        # every attribute read outside reset() must exist before the first reset
+        self._init_episode_vars()
 
-        #log_level("ERROR")
+    # ------------------------------------------------------------------ setup
+    def _load_event_names(self):
+        path = Path(__file__).parent / "events.json"
+        if not path.exists():
+            logger.warning("events.json not found at %s; event naming disabled", path)
+            return {}
+        with open(path) as f:
+            return json.load(f)
+
+    def _start_emulator(self):
+        if self.pyboy is not None:
+            self.pyboy.stop(save=False)
         self.pyboy = PyBoy(
-            config["gb_path"],
-            #debugging=False,
-            #disable_input=False,
-            window=head,
+            str(self.gb_path),
+            window="null" if self.headless else "SDL2",
         )
+        # 0 == unbounded. Without this, headless training runs at real time.
+        self.pyboy.set_emulation_speed(0 if self.headless else 6)
 
-        #self.screen = self.pyboy.botsupport_manager().screen()
+    def _init_episode_vars(self):
+        self.init_map_mem()
+        self.agent_stats = deque(maxlen=self.stats_maxlen)
+        self.explore_map = np.zeros(GLOBAL_MAP_SHAPE, dtype=np.uint8)
+        self.recent_screens = np.zeros(self.output_shape, dtype=np.uint8)
+        self.recent_actions = np.zeros((self.action_history_len,), dtype=np.int64)
 
-        if not config["headless"]:
-            self.pyboy.set_emulation_speed(6)
-
-    def reset(self, seed=None, options={}):
-        try:
-            self.seed = seed
-            # restart game, skipping credits
-            # with open(self.init_state, "rb") as f:
-            #     self.pyboy.load_state(f)
-
-            self.init_map_mem()
-            self.agent_stats = []
-            self.explore_map_dim = GLOBAL_MAP_SHAPE
-            self.explore_map = np.zeros(self.explore_map_dim, dtype=np.uint8)
-            self.recent_screens = np.zeros(self.output_shape, dtype=np.uint8)
-            self.recent_actions = np.zeros((self.frame_stacks,), dtype=np.uint8)
-
-            self.levels_satisfied = False
-            self.base_explore = 0
-            self.max_opponent_level = 0
-            self.max_event_rew = 0
-            self.max_level_rew = 0
-            self.last_health = 1
-            self.total_healing_rew = 0
-            self.died_count = 0
-            self.party_size = 0
-            self.step_count = 0
-            self.last_in_battle = False
-            self.battle_won_count = 0
-
-            self.base_event_flags = sum([
-                self.bit_count(self.read_m(i))
-                for i in range(event_flags_start, event_flags_end)
-            ])
-            self.current_event_flags_set = {}
-            self.max_map_progress = 0
-            self.progress_reward = self.get_game_state_reward()
-            self.total_reward = sum([val for _, val in self.progress_reward.items()])
-            self.reset_count += 1
-            
-            obs = self._get_obs()
-            if obs is None:
-                print("DEBUG: _get_obs returned None!")
-                return {}, {}
-            return obs, {}
-        except Exception as e:
-            print(f"DEBUG: Exception in reset: {e}")
-            raise e
+        self.max_event_rew = 0.0
+        self.max_level_rew = 0.0
+        self.last_health = 1.0
+        self.total_healing_rew = 0.0
+        self.died_count = 0
+        self.party_size = 0
+        self.step_count = 0
+        self.last_in_battle = False
+        self.last_enemy_hp = 0
+        self.enemy_fainted_pending = False
+        self.battle_won_count = 0
+        self.battles_entered = 0
+        self.base_event_flags = 0
+        self.current_event_flags_set = {}
+        self.max_map_progress = 0
+        self.progress_reward = {}
+        self.total_reward = 0.0
+        self.last_step_reward = 0.0
 
     def init_map_mem(self):
         self.seen_coords = {}
 
-    def render(self, reduce_res=True):
-        game_pixels_render = self.pyboy.screen.ndarray[:,:,0:1].copy()
-        
-        # Add telemetry overlay if not headless
-        if not self.headless:
-            # Add simple text for status
-            text = f"HP: {self.read_hp_fraction():.2f} | R: {self.total_reward:.1f}"
-            cv2.putText(game_pixels_render, text, (5, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    # --------------------------------------------------- initial state / boot
+    def _load_initial_state(self):
+        """Load init_state, or bootstrap one if it is missing/incompatible.
 
-        if reduce_res:
-            game_pixels_render = (
-                downscale_local_mean(game_pixels_render, (2,2,1))
-            ).astype(np.uint8)
-        return game_pixels_render
-    
-    def _get_obs(self):
-        
-        screen = self.render()
+        PyBoy save states are version-locked, so a state written by 2.4.0
+        cannot be read by 2.7.0. On failure we rebuild the emulator (a partial
+        load leaves it corrupt), skip the intro, and rewrite the state file.
+        """
+        if self.init_state is not None and self.init_state.exists():
+            try:
+                with open(self.init_state, "rb") as f:
+                    self.pyboy.load_state(f)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Could not load %s (%s). Rebuilding a fresh state — this is "
+                    "expected after a PyBoy version bump.", self.init_state, exc
+                )
+                self._start_emulator()
 
-        self.update_recent_screens(screen)
-        
-        # normalize to approx 0-1
-        level_sum = 0.02 * sum([
-            self.read_m(a) for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]
-        ])
+        self._boot_and_skip_intro()
+        if self.init_state is not None:
+            self.init_state.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.init_state, "wb") as f:
+                self.pyboy.save_state(f)
+            logger.warning("Wrote a new init state to %s", self.init_state)
 
-        observation = {
-            "screens": self.recent_screens,
-            "health": np.array([self.read_hp_fraction()]),
-            "level": self.fourier_encode(level_sum),
-            "badges": np.array([int(bit) for bit in f"{self.read_m(0xD356):08b}"], dtype=np.int8),
-            "events": np.array(self.read_event_bits(), dtype=np.int8),
-            "map": self.get_explore_map()[:, :, None],
-            "recent_actions": self.recent_actions
-        }
+    def _boot_and_skip_intro(self):
+        """Best-effort automatic new game.
 
-        return observation
+        Mashes START/A until the player is standing in Red's bedroom. Blind
+        A-mashing accepts the default naming screen, so the player and rival
+        end up named 'AAAAAAA'. If you care about the start point, use
+        make_init_state.py instead and point init_state at its output.
+        """
+        buttons = [
+            (WindowEvent.PRESS_BUTTON_START, WindowEvent.RELEASE_BUTTON_START),
+            (WindowEvent.PRESS_BUTTON_A, WindowEvent.RELEASE_BUTTON_A),
+        ]
+        frames = 0
+        i = 0
+        while frames < self.boot_max_frames:
+            press, release = buttons[i % len(buttons)]
+            self.pyboy.send_input(press)
+            self.pyboy.tick(6, False)
+            self.pyboy.send_input(release)
+            self.pyboy.tick(10, False)
+            frames += 16
+            i += 1
+            if self.read_m(MAP_N) == REDS_HOUSE_2F and self.read_m(PARTY_COUNT) == 0:
+                break
+        else:
+            logger.warning(
+                "Intro skip did not reach the overworld in %d frames; "
+                "the emulator may be sitting on a menu.", self.boot_max_frames
+            )
+        self.pyboy.tick(self.boot_settle_frames, False)
+
+    # ------------------------------------------------------------------ gym
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._close_video()
+        self._load_initial_state()
+        self._init_episode_vars()
+
+        self.base_event_flags = int(
+            np.unpackbits(self.read_range(EVENT_FLAGS_START, EVENT_FLAGS_END)).sum()
+        )
+        self.last_health = self.read_hp_fraction()
+        self.party_size = self.read_m(PARTY_COUNT)
+        self.progress_reward = self.get_game_state_reward()
+        self.total_reward = sum(self.progress_reward.values())
+        self.reset_count += 1
+
+        return self._get_obs(), {}
 
     def step(self, action):
-
         if self.save_video and self.step_count == 0:
             self.start_video()
 
-        was_in_battle = self.read_m(0xD057) != 0
-
         self.run_action_on_emulator(action)
-        
-        now_in_battle = self.read_m(0xD057) != 0
-        if was_in_battle and not now_in_battle and self.read_hp_fraction() > 0:
-            self.battle_won_count += 1
-
-        self.append_agent_stats(action)
-
-        self.update_recent_actions(action)
-
-        self.update_seen_coords()
-
-        self.update_explore_map()
-
-        self.update_heal_reward()
-
-        self.party_size = self.read_m(0xD163)
-
-        new_reward = self.update_reward()
-
-        self.last_health = self.read_hp_fraction()
-
-        self.update_map_progress()
-
-        step_limit_reached = self.check_if_done()
-
-        obs = self._get_obs()
-
-        # self.save_and_print_info(step_limit_reached, obs)
-
-        # create a map of all event flags set, with names where possible
-        #if step_limit_reached:
-        if self.step_count % 100 == 0:
-            for address in range(event_flags_start, event_flags_end):
-                val = self.read_m(address)
-                for idx, bit in enumerate(f"{val:08b}"):
-                    if bit == "1":
-                        # TODO this currently seems to be broken!
-                        key = f"0x{address:X}-{idx}"
-                        if key in self.event_names.keys():
-                            self.current_event_flags_set[key] = self.event_names[key]
-                        else:
-                            print(f"could not find key: {key}")
-
         self.step_count += 1
 
-        return obs, new_reward, False, step_limit_reached, {}
-    
-    def run_action_on_emulator(self, action):
-        # press button then release after some steps
-        self.pyboy.send_input(self.valid_actions[action])
-        # disable rendering when we don't need it
-        render_screen = self.save_video or not self.headless
-        press_step = 8
-        self.pyboy.tick(press_step, render_screen)
-        self.pyboy.send_input(self.release_actions[action])
-        self.pyboy.tick(self.act_freq - press_step - 1, render_screen)
-        self.pyboy.tick(1, True)
-        if self.save_video and self.fast_video:
-            self.add_video_frame()
-        
-    def append_agent_stats(self, action):
-        x_pos, y_pos, map_n = self.get_game_coords()
-        levels = [
-            self.read_m(a) for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]
-        ]
-        self.agent_stats.append(
-            {
-                "step": self.step_count,
-                "x": x_pos,
-                "y": y_pos,
-                "map": map_n,
-                "max_map_progress": self.max_map_progress,
-                "last_action": action,
-                "pcount": self.read_m(0xD163),
-                "levels": levels,
-                "levels_sum": sum(levels),
-                "ptypes": self.read_party(),
-                "hp": self.read_hp_fraction(),
-                "coord_count": len(self.seen_coords),
-                "deaths": self.died_count,
-                "badge": self.get_badges(),
-                "event": self.progress_reward["event"],
-                "healr": self.total_healing_rew,
-            }
-        )
+        self.update_battle_tracking()
+        self.update_recent_actions(action)
+        self.update_seen_coords()
+        self.update_explore_map()
+        self.update_heal_reward()
+        self.party_size = self.read_m(PARTY_COUNT)
+        self.update_map_progress()
 
-    def start_video(self):
+        reward = self.update_reward()
+        self.last_health = self.read_hp_fraction()
 
-        if self.full_frame_writer is not None:
-            self.full_frame_writer.close()
-        if self.model_frame_writer is not None:
-            self.model_frame_writer.close()
-        if self.map_frame_writer is not None:
-            self.map_frame_writer.close()
+        obs = self._get_obs()
+        terminated = self.check_terminated()
+        truncated = self.step_count >= self.max_steps
 
-        base_dir = self.s_path / Path("rollouts")
-        base_dir.mkdir(exist_ok=True)
-        full_name = Path(
-            f"full_reset_{self.reset_count}_id{self.instance_id}"
-        ).with_suffix(".mp4")
-        model_name = Path(
-            f"model_reset_{self.reset_count}_id{self.instance_id}"
-        ).with_suffix(".mp4")
-        self.full_frame_writer = media.VideoWriter(
-            base_dir / full_name, (144, 160), fps=60, input_format="gray"
-        )
-        self.full_frame_writer.__enter__()
-        self.model_frame_writer = media.VideoWriter(
-            base_dir / model_name, self.output_shape[:2], fps=60, input_format="gray"
-        )
-        self.model_frame_writer.__enter__()
-        map_name = Path(
-            f"map_reset_{self.reset_count}_id{self.instance_id}"
-        ).with_suffix(".mp4")
-        self.map_frame_writer = media.VideoWriter(
-            base_dir / map_name,
-            (self.coords_pad*4, self.coords_pad*4), 
-            fps=60, input_format="gray"
-        )
-        self.map_frame_writer.__enter__()
+        if self.step_count % self.stats_log_freq == 0:
+            self.append_agent_stats(action)
+        if self.debug_events and self.step_count % self.event_scan_freq == 0:
+            self.scan_event_flags()
 
-    def add_video_frame(self):
-        self.full_frame_writer.add_image(
-            self.render(reduce_res=False)[:,:,0]
-        )
-        self.model_frame_writer.add_image(
-            self.render(reduce_res=True)[:,:,0]
-        )
-        self.map_frame_writer.add_image(
-            self.get_explore_map()
-        )
+        self.save_and_print_info(terminated or truncated, obs)
+        if terminated or truncated:
+            self._close_video()
 
-    def get_game_coords(self):
-        return (self.read_m(0xD362), self.read_m(0xD361), self.read_m(0xD35E))
+        return obs, reward, terminated, truncated, {}
 
-    def update_seen_coords(self):
-        # if not in battle
-        if self.read_m(0xD057) == 0:
-            x_pos, y_pos, map_n = self.get_game_coords()
-            coord_string = f"x:{x_pos} y:{y_pos} m:{map_n}"
-            if coord_string in self.seen_coords.keys():
-                self.seen_coords[coord_string] += 1
-            else:
-                self.seen_coords[coord_string] = 1
-            #self.seen_coords[coord_string] = self.step_count
+    def close(self):
+        self._close_video()
+        if self.pyboy is not None:
+            self.pyboy.stop(save=False)
+            self.pyboy = None
 
-    def get_current_coord_count_reward(self):
-        x_pos, y_pos, map_n = self.get_game_coords()
-        coord_string = f"x:{x_pos} y:{y_pos} m:{map_n}"
-        if coord_string in self.seen_coords.keys():
-            count = self.seen_coords[coord_string]
-        else:
-            count = 0
-        return 0 if count < 600 else 1
+    def render(self):
+        """Gymnasium-compliant render: full-res RGB frame."""
+        return self.pyboy.screen.ndarray[:, :, :3].copy()
 
-    def get_global_coords(self):
-        x_pos, y_pos, map_n = self.get_game_coords()
-        return local_to_global(y_pos, x_pos, map_n)
+    # ------------------------------------------------------------ observation
+    def _get_screen(self, reduce_res=True):
+        frame = self.pyboy.screen.ndarray[:, :, 0:1].copy()
+        if reduce_res:
+            frame = np.round(
+                downscale_local_mean(frame, (2, 2, 1))
+            ).clip(0, 255).astype(np.uint8)
+        return frame
 
-    def update_explore_map(self):
-        c = self.get_global_coords()
-        if c[0] >= self.explore_map.shape[0] or c[1] >= self.explore_map.shape[1]:
-            print(f"coord out of bounds! global: {c} game: {self.get_game_coords()}")
-            pass
-        else:
-            self.explore_map[c[0], c[1]] = 255
+    def _get_obs(self):
+        self.update_recent_screens(self._get_screen(reduce_res=True))
+        level_sum = 0.02 * self.get_levels_sum()
+        return {
+            "screens": self.recent_screens,
+            "health": np.array([self.read_hp_fraction()], dtype=np.float32),
+            "level": self.fourier_encode(level_sum),
+            "badges": np.unpackbits(
+                np.array([self.read_m(BADGES)], dtype=np.uint8)).astype(np.int8),
+            "events": self.read_event_bits(),
+            "map": self.get_explore_map()[:, :, None],
+            "recent_actions": self.recent_actions,
+        }
 
-    def get_explore_map(self):
-        c = self.get_global_coords()
-        if c[0] >= self.explore_map.shape[0] or c[1] >= self.explore_map.shape[1]:
-            out = np.zeros((self.coords_pad*2, self.coords_pad*2), dtype=np.uint8)
-        else:
-            out = self.explore_map[
-                c[0]-self.coords_pad:c[0]+self.coords_pad,
-                c[1]-self.coords_pad:c[1]+self.coords_pad
-            ]
-        return repeat(out, 'h w -> (h h2) (w w2)', h2=2, w2=2)
-    
     def update_recent_screens(self, cur_screen):
         self.recent_screens = np.roll(self.recent_screens, 1, axis=2)
-        self.recent_screens[:, :, 0] = cur_screen[:,:, 0]
+        self.recent_screens[:, :, 0] = cur_screen[:, :, 0]
 
     def update_recent_actions(self, action):
         self.recent_actions = np.roll(self.recent_actions, 1)
-        self.recent_actions[0] = action
+        self.recent_actions[0] = int(action)
 
-    def update_reward(self):
-        # compute reward
-        self.progress_reward = self.get_game_state_reward()
-        new_total = sum(
-            [val for _, val in self.progress_reward.items()]
-        )
-        new_step = new_total - self.total_reward
+    def fourier_encode(self, val):
+        return np.sin(val * 2 ** np.arange(self.enc_freqs)).astype(np.float32)
 
-        self.total_reward = new_total
-        return new_step
+    # ------------------------------------------------------------- emulation
+    def run_action_on_emulator(self, action):
+        render_screen = self.save_video or not self.headless
+        press = self.valid_actions[action]
+        release = self.release_actions[action]
 
-    def group_rewards(self):
-        prog = self.progress_reward
-        # these values are only used by memory
-        return (
-            prog["level"] * 100 / self.reward_scale,
-            self.read_hp_fraction() * 2000,
-            prog["explore"] * 150 / (self.explore_weight * self.reward_scale),
-        )
+        if self.save_video and not self.fast_video:
+            # every emulated frame becomes a video frame
+            self.pyboy.send_input(press)
+            for i in range(self.act_freq):
+                if i == self.press_step:
+                    self.pyboy.send_input(release)
+                self.pyboy.tick(1, True)
+                self.add_video_frame()
+            return
 
-    def check_if_done(self):
-        done = self.step_count >= self.max_steps - 1
-        # done = self.read_hp_fraction() == 0 # end game on loss
-        return done
+        self.pyboy.send_input(press)
+        self.pyboy.tick(self.press_step, render_screen)
+        self.pyboy.send_input(release)
+        remaining = max(0, self.act_freq - self.press_step - 1)
+        if remaining:
+            self.pyboy.tick(remaining, render_screen)
+        self.pyboy.tick(1, True)  # final frame always rendered: it feeds the obs
+        if self.save_video and self.fast_video:
+            self.add_video_frame()
 
-    def save_and_print_info(self, done, obs):
-        if self.print_rewards:
-            prog_string = f"step: {self.step_count:6d}"
-            for key, val in self.progress_reward.items():
-                prog_string += f" {key}: {val:5.2f}"
-            prog_string += f" sum: {self.total_reward:5.2f}"
-            print(f"\r{prog_string}", end="", flush=True)
-
-        if self.step_count % 50 == 0:
-            plt.imsave(
-                self.s_path / Path(f"curframe_{self.instance_id}.jpeg"),
-                self.render(reduce_res=False)[:,:, 0],
-            )
-
-        if self.print_rewards and done:
-            print("", flush=True)
-            if self.save_final_state:
-                fs_path = self.s_path / Path("final_states")
-                fs_path.mkdir(exist_ok=True)
-                plt.imsave(
-                    fs_path
-                    / Path(
-                        f"frame_r{self.total_reward:.4f}_{self.reset_count}_explore_map.jpeg"
-                    ),
-                    obs["map"][:,:, 0],
-                )
-                plt.imsave(
-                    fs_path
-                    / Path(
-                        f"frame_r{self.total_reward:.4f}_{self.reset_count}_full_explore_map.jpeg"
-                    ),
-                    self.explore_map,
-                )
-                plt.imsave(
-                    fs_path
-                    / Path(
-                        f"frame_r{self.total_reward:.4f}_{self.reset_count}_full.jpeg"
-                    ),
-                    self.render(reduce_res=False)[:,:, 0],
-                )
-
-        if self.save_video and done:
-            self.full_frame_writer.close()
-            self.model_frame_writer.close()
-            self.map_frame_writer.close()
-
+    # -------------------------------------------------------------- memory io
     def read_m(self, addr):
-        #return self.pyboy.get_memory_value(addr)
         return self.pyboy.memory[addr]
 
+    def read_range(self, start, end):
+        return np.frombuffer(
+            bytes(self.pyboy.memory[start:end]), dtype=np.uint8
+        )
+
     def read_bit(self, addr, bit: int) -> bool:
-        # add padding so zero will read '0b100000000' instead of '0b0'
-        return bin(256 + self.read_m(addr))[-bit - 1] == "1"
-
-    def read_event_bits(self):
-        return [
-            int(bit) for i in range(event_flags_start, event_flags_end) 
-            for bit in f"{self.read_m(i):08b}"
-        ]
-
-    def get_levels_sum(self):
-        min_poke_level = 2
-        starter_additional_levels = 4
-        poke_levels = [
-            max(self.read_m(a) - min_poke_level, 0)
-            for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]
-        ]
-        return max(sum(poke_levels) - starter_additional_levels, 0)
-
-    def get_levels_reward(self):
-        explore_thresh = 22
-        scale_factor = 4
-        level_sum = self.get_levels_sum()
-        if level_sum < explore_thresh:
-            scaled = level_sum
-        else:
-            scaled = (level_sum - explore_thresh) / scale_factor + explore_thresh
-        self.max_level_rew = max(self.max_level_rew, scaled)
-        return self.max_level_rew
-
-    def get_badges(self):
-        return self.bit_count(self.read_m(0xD356))
-
-    def read_party(self):
-        return [
-            self.read_m(addr)
-            for addr in [0xD164, 0xD165, 0xD166, 0xD167, 0xD168, 0xD169]
-        ]
-
-    def get_all_events_reward(self):
-        # adds up all event flags, exclude museum ticket
-        return max(
-            sum([
-                self.bit_count(self.read_m(i))
-                for i in range(event_flags_start, event_flags_end)
-            ])
-            - self.base_event_flags
-            - int(self.read_bit(museum_ticket[0], museum_ticket[1])),
-            0,
-        )
-
-    def get_game_state_reward(self, print_stats=False):
-        # addresses from https://datacrystal.romhacking.net/wiki/Pok%C3%A9mon_Red/Blue:RAM_map
-        # https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm
-        
-        in_battle = self.read_m(0xD057) != 0
-        
-        state_scores = {
-            "event": self.reward_scale * self.update_max_event_rew() * 4,
-            "level": self.reward_scale * self.get_levels_reward() * 2,
-            "heal": self.reward_scale * self.total_healing_rew * 10,
-            "badge": self.reward_scale * self.get_badges() * 10,
-            "explore": self.reward_scale * self.explore_weight * len(self.seen_coords) * 0.1,
-            "pokedex": self.reward_scale * self.read_m(0xD30A) * 20,
-            "stuck": self.reward_scale * self.get_current_coord_count_reward() * -0.05,
-            "battle": self.reward_scale * (2 if in_battle else 0),
-            "win": self.reward_scale * self.battle_won_count * 50
-        }
-
-        self.last_in_battle = in_battle
-        return state_scores
-
-    def update_max_op_level(self):
-        opp_base_level = 5
-        opponent_level = (
-            max([
-                self.read_m(a)
-                for a in [0xD8C5, 0xD8F1, 0xD91D, 0xD949, 0xD975, 0xD9A1]
-            ])
-            - opp_base_level
-        )
-        self.max_opponent_level = max(self.max_opponent_level, opponent_level)
-        return self.max_opponent_level
-
-    def update_max_event_rew(self):
-        cur_rew = self.get_all_events_reward()
-        self.max_event_rew = max(cur_rew, self.max_event_rew)
-        return self.max_event_rew
-
-    def update_heal_reward(self):
-        cur_health = self.read_hp_fraction()
-        # if health increased and party size did not change
-        if cur_health > self.last_health and self.read_m(0xD163) == self.party_size:
-            if self.last_health > 0:
-                heal_amount = cur_health - self.last_health
-                self.total_healing_rew += heal_amount * heal_amount
-            else:
-                self.died_count += 1
-
-    def read_hp_fraction(self):
-        hp_sum = sum([
-            self.read_hp(add)
-            for add in [0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248]
-        ])
-        max_hp_sum = sum([
-            self.read_hp(add)
-            for add in [0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269]
-        ])
-        max_hp_sum = max(max_hp_sum, 1)
-        return hp_sum / max_hp_sum
+        return bool((self.read_m(addr) >> bit) & 1)
 
     def read_hp(self, start):
         return 256 * self.read_m(start) + self.read_m(start + 1)
 
-    # built-in since python 3.10
-    def bit_count(self, bits):
-        return bin(bits).count("1")
-    
-    def fourier_encode(self, val):
-        return np.sin(val * 2 ** np.arange(self.enc_freqs))
-    
+    def read_event_bits(self):
+        return np.unpackbits(
+            self.read_range(EVENT_FLAGS_START, EVENT_FLAGS_END)
+        ).astype(np.int8)
+
+    def read_party(self):
+        return [self.read_m(a) for a in PARTY_SPECIES]
+
+    def get_game_coords(self):
+        return (self.read_m(X_POS), self.read_m(Y_POS), self.read_m(MAP_N))
+
+    def read_hp_fraction(self):
+        hp_sum = sum(self.read_hp(a) for a in PARTY_HP)
+        max_hp_sum = max(sum(self.read_hp(a) for a in PARTY_MAX_HP), 1)
+        return float(np.clip(hp_sum / max_hp_sum, 0.0, 1.0))
+
+    def get_badges(self):
+        return popcount(self.read_m(BADGES))
+
+    def get_pokedex_owned(self):
+        return int(np.unpackbits(self.read_range(*POKEDEX_OWNED)).sum())
+
+    # ---------------------------------------------------------- explore map
+    def get_global_coords(self):
+        x_pos, y_pos, map_n = self.get_game_coords()
+        gy, gx = local_to_global(y_pos, x_pos, map_n)
+        if 0 <= gy < GLOBAL_MAP_SHAPE[0] and 0 <= gx < GLOBAL_MAP_SHAPE[1]:
+            return gy, gx
+        return None
+
+    def update_explore_map(self):
+        c = self.get_global_coords()
+        if c is None:
+            logger.debug("coord out of bounds: game=%s", self.get_game_coords())
+            return
+        self.explore_map[c[0], c[1]] = 255
+
+    def get_explore_map(self):
+        pad = self.coords_pad
+        out = np.zeros((pad * 2, pad * 2), dtype=np.uint8)
+        c = self.get_global_coords()
+        if c is not None:
+            gy, gx = c
+            y0, y1 = gy - pad, gy + pad
+            x0, x1 = gx - pad, gx + pad
+            sy0, sx0 = max(0, y0), max(0, x0)
+            sy1 = min(self.explore_map.shape[0], y1)
+            sx1 = min(self.explore_map.shape[1], x1)
+            if sy1 > sy0 and sx1 > sx0:
+                out[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = \
+                    self.explore_map[sy0:sy1, sx0:sx1]
+        return repeat(out, "h w -> (h h2) (w w2)", h2=2, w2=2)
+
+    def update_seen_coords(self):
+        if self.read_m(IN_BATTLE) != 0:
+            return
+        x_pos, y_pos, map_n = self.get_game_coords()
+        key = f"x:{x_pos} y:{y_pos} m:{map_n}"
+        self.seen_coords[key] = self.seen_coords.get(key, 0) + 1
+
+    def get_current_coord_count_reward(self):
+        x_pos, y_pos, map_n = self.get_game_coords()
+        key = f"x:{x_pos} y:{y_pos} m:{map_n}"
+        return 0 if self.seen_coords.get(key, 0) < self.stuck_threshold else 1
+
     def update_map_progress(self):
-        map_idx = self.read_m(0xD35E)
-        self.max_map_progress = max(self.max_map_progress, self.get_map_progress(map_idx))
-    
+        self.max_map_progress = max(
+            self.max_map_progress, self.get_map_progress(self.read_m(MAP_N))
+        )
+
     def get_map_progress(self, map_idx):
-        if map_idx in self.essential_map_locations.keys():
-            return self.essential_map_locations[map_idx]
+        return self.essential_map_locations.get(map_idx, -1)
+
+    # ------------------------------------------------------------- tracking
+    def update_battle_tracking(self):
+        """Count only genuine victories.
+
+        The old check ('was in battle, now isn't, HP > 0') also fired on
+        running away and on menu exits, which at 50 pts a pop was the biggest
+        exploit in the reward function. We now require the enemy's HP to have
+        actually hit zero during the battle.
+        """
+        in_battle = self.read_m(IN_BATTLE) != 0
+
+        if in_battle:
+            if not self.last_in_battle:
+                self.battles_entered += 1
+                self.enemy_fainted_pending = False
+                self.last_enemy_hp = self.read_hp(ENEMY_MON_HP)
+            enemy_hp = self.read_hp(ENEMY_MON_HP)
+            if self.last_enemy_hp > 0 and enemy_hp == 0:
+                self.enemy_fainted_pending = True
+            self.last_enemy_hp = enemy_hp
         else:
-            return -1
+            if (self.last_in_battle and self.enemy_fainted_pending
+                    and self.read_hp_fraction() > 0):
+                self.battle_won_count += 1
+            self.enemy_fainted_pending = False
+            self.last_enemy_hp = 0
+
+        self.last_in_battle = in_battle
+
+    def update_heal_reward(self):
+        cur_health = self.read_hp_fraction()
+        party_unchanged = self.read_m(PARTY_COUNT) == self.party_size
+
+        if self.last_health > 0 and cur_health <= 0:
+            self.died_count += 1
+        elif cur_health > self.last_health and party_unchanged and self.last_health > 0:
+            # linear in the fraction healed; the old version squared this,
+            # which made realistic heals nearly worthless
+            self.total_healing_rew += cur_health - self.last_health
+
+    def check_terminated(self):
+        return self.party_size > 0 and self.read_hp_fraction() <= 0.0
+
+    # -------------------------------------------------------------- rewards
+    def get_levels_sum(self):
+        min_poke_level = 2
+        starter_additional_levels = 4
+        poke_levels = [max(self.read_m(a) - min_poke_level, 0) for a in PARTY_LEVELS]
+        return max(sum(poke_levels) - starter_additional_levels, 0)
+
+    def get_levels_reward(self):
+        explore_thresh, scale_factor = 22, 4
+        level_sum = self.get_levels_sum()
+        scaled = (level_sum if level_sum < explore_thresh
+                  else (level_sum - explore_thresh) / scale_factor + explore_thresh)
+        self.max_level_rew = max(self.max_level_rew, scaled)
+        return self.max_level_rew
+
+    def get_all_events_reward(self):
+        total = int(np.unpackbits(
+            self.read_range(EVENT_FLAGS_START, EVENT_FLAGS_END)).sum())
+        return max(
+            total - self.base_event_flags
+            - int(self.read_bit(MUSEUM_TICKET[0], MUSEUM_TICKET[1])),
+            0,
+        )
+
+    def update_max_event_rew(self):
+        self.max_event_rew = max(self.get_all_events_reward(), self.max_event_rew)
+        return self.max_event_rew
+
+    def get_game_state_reward(self):
+        """Monotonic (non-decreasing) reward components only.
+
+        Anything that can go back down must not live here — update_reward()
+        differences this dict, so a term that falls refunds its own reward and
+        becomes farmable. Transient terms go in get_instantaneous_reward().
+        """
+        return {
+            "event": self.reward_scale * self.update_max_event_rew() * 4,
+            "level": self.reward_scale * self.get_levels_reward() * 2,
+            "heal": self.reward_scale * self.total_healing_rew * 10,
+            "badge": self.reward_scale * self.get_badges() * 10,
+            "explore": (self.reward_scale * self.explore_weight
+                        * len(self.seen_coords) * 0.1),
+            "pokedex": self.reward_scale * self.get_pokedex_owned() * 2,
+            "battle": self.reward_scale * self.battles_entered * 0.5,
+            "win": self.reward_scale * self.battle_won_count * 50,
+        }
+
+    def get_instantaneous_reward(self):
+        return self.reward_scale * self.get_current_coord_count_reward() * -0.05
+
+    def update_reward(self):
+        self.progress_reward = self.get_game_state_reward()
+        new_total = sum(self.progress_reward.values())
+        delta = new_total - self.total_reward
+        self.total_reward = new_total
+        self.last_step_reward = delta + self.get_instantaneous_reward()
+        return self.last_step_reward
+
+    # ------------------------------------------------------------- reporting
+    def append_agent_stats(self, action):
+        x_pos, y_pos, map_n = self.get_game_coords()
+        levels = [self.read_m(a) for a in PARTY_LEVELS]
+        self.agent_stats.append({
+            "step": self.step_count,
+            "x": x_pos, "y": y_pos, "map": map_n,
+            "max_map_progress": self.max_map_progress,
+            "last_action": int(action),
+            "pcount": self.read_m(PARTY_COUNT),
+            "levels": levels,
+            "levels_sum": sum(levels),
+            "ptypes": self.read_party(),
+            "hp": self.read_hp_fraction(),
+            "coord_count": len(self.seen_coords),
+            "deaths": self.died_count,
+            "badge": self.get_badges(),
+            "event": self.progress_reward.get("event", 0),
+            "healr": self.total_healing_rew,
+            "wins": self.battle_won_count,
+        })
+
+    def scan_event_flags(self):
+        """Map set event flags to names.
+
+        Bit indices in event_constants.asm are LSB-first, but enumerating an
+        f'{val:08b}' string walks MSB-first — that inversion is why the old
+        lookup never matched anything.
+        """
+        for address in range(EVENT_FLAGS_START, EVENT_FLAGS_END):
+            val = self.read_m(address)
+            if not val:
+                continue
+            for bit in range(8):
+                if (val >> bit) & 1:
+                    key = f"0x{address:X}-{bit}"
+                    if key in self.event_names:
+                        self.current_event_flags_set[key] = self.event_names[key]
+                    else:
+                        logger.debug("unnamed event flag: %s", key)
+
+    def save_and_print_info(self, done, obs):
+        if self.print_rewards:
+            prog = " ".join(f"{k}: {v:5.2f}" for k, v in self.progress_reward.items())
+            print(f"\rstep: {self.step_count:6d} {prog} sum: {self.total_reward:5.2f}",
+                  end="", flush=True)
+
+        if not (done and self.save_final_state):
+            return
+
+        import matplotlib.pyplot as plt  # imported lazily: heavy per worker
+        if self.print_rewards:
+            print("", flush=True)
+        fs_path = self.s_path / "final_states"
+        fs_path.mkdir(parents=True, exist_ok=True)
+        stem = f"frame_r{self.total_reward:.4f}_{self.reset_count}"
+        plt.imsave(fs_path / f"{stem}_explore_map.jpeg", obs["map"][:, :, 0])
+        plt.imsave(fs_path / f"{stem}_full_explore_map.jpeg", self.explore_map)
+        plt.imsave(fs_path / f"{stem}_full.jpeg",
+                   self._get_screen(reduce_res=False)[:, :, 0])
+
+    # ----------------------------------------------------------------- video
+    def start_video(self):
+        import mediapy as media  # imported lazily
+        self._close_video()
+        base_dir = self.s_path / "rollouts"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        tag = f"reset_{self.reset_count}_id{self.instance_id}.mp4"
+
+        self.full_frame_writer = media.VideoWriter(
+            base_dir / f"full_{tag}", (144, 160), fps=60, input_format="gray")
+        self.full_frame_writer.__enter__()
+        self.model_frame_writer = media.VideoWriter(
+            base_dir / f"model_{tag}", self.output_shape[:2], fps=60,
+            input_format="gray")
+        self.model_frame_writer.__enter__()
+        self.map_frame_writer = media.VideoWriter(
+            base_dir / f"map_{tag}",
+            (self.coords_pad * 4, self.coords_pad * 4), fps=60,
+            input_format="gray")
+        self.map_frame_writer.__enter__()
+
+    def add_video_frame(self):
+        if self.full_frame_writer is None:
+            return
+        # telemetry is burned into the video only, never into the observation
+        full = self._get_screen(reduce_res=False)[:, :, 0]
+        if self.print_rewards:
+            import cv2  # imported lazily
+            full = np.ascontiguousarray(full)
+            cv2.putText(
+                full,
+                f"HP: {self.read_hp_fraction():.2f} R: {self.total_reward:.1f}",
+                (5, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 255, 1)
+        self.full_frame_writer.add_image(full)
+        self.model_frame_writer.add_image(self._get_screen(reduce_res=True)[:, :, 0])
+        self.map_frame_writer.add_image(self.get_explore_map())
+
+    def _close_video(self):
+        for name in ("full_frame_writer", "model_frame_writer", "map_frame_writer"):
+            writer = getattr(self, name, None)
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    logger.debug("writer %s failed to close", name, exc_info=True)
+                setattr(self, name, None)
