@@ -12,3 +12,8 @@ session_*
 PokemonRed.gb.state
 venv*
 .python-version
+
+# Ignore training runs
+v2/runs/
+v2/rollouts/
+v2/final_states/

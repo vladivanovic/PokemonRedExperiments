@@ -1,6 +1,7 @@
 import uuid
 import json
 from pathlib import Path
+import cv2
 
 import numpy as np
 from skimage.transform import downscale_local_mean
@@ -147,28 +148,37 @@ class RedGymEnv(Env):
         self.died_count = 0
         self.party_size = 0
         self.step_count = 0
+        self.last_in_battle = False
+        self.battle_won_count = 0
 
-        self.base_event_flags = sum([
-                self.bit_count(self.read_m(i))
-                for i in range(event_flags_start, event_flags_end)
-        ])
 
-        self.current_event_flags_set = {}
 
-        # experiment! 
-        # self.max_steps += 128
 
-        self.max_map_progress = 0
-        self.progress_reward = self.get_game_state_reward()
-        self.total_reward = sum([val for _, val in self.progress_reward.items()])
-        self.reset_count += 1
-        return self._get_obs(), {}
+
+
+
+
+
+
+
+
+
+
+
+
 
     def init_map_mem(self):
         self.seen_coords = {}
 
     def render(self, reduce_res=True):
-        game_pixels_render = self.pyboy.screen.ndarray[:,:,0:1]  # (144, 160, 3)
+        game_pixels_render = self.pyboy.screen.ndarray[:,:,0:1].copy()
+        
+        # Add telemetry overlay if not headless
+        if not self.headless:
+            # Add simple text for status
+            text = f"HP: {self.read_hp_fraction():.2f} | R: {self.total_reward:.1f}"
+            cv2.putText(game_pixels_render, text, (5, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
         if reduce_res:
             game_pixels_render = (
                 downscale_local_mean(game_pixels_render, (2,2,1))
@@ -203,7 +213,14 @@ class RedGymEnv(Env):
         if self.save_video and self.step_count == 0:
             self.start_video()
 
+        was_in_battle = self.read_m(0xD057) != 0
+
         self.run_action_on_emulator(action)
+        
+        now_in_battle = self.read_m(0xD057) != 0
+        if was_in_battle and not now_in_battle and self.read_hp_fraction() > 0:
+            self.battle_won_count += 1
+
         self.append_agent_stats(action)
 
         self.update_recent_actions(action)
@@ -516,15 +533,15 @@ class RedGymEnv(Env):
         # https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm
         state_scores = {
             "event": self.reward_scale * self.update_max_event_rew() * 4,
-            #"level": self.reward_scale * self.get_levels_reward(),
+            "level": self.reward_scale * self.get_levels_reward() * 2,
             "heal": self.reward_scale * self.total_healing_rew * 10,
-            #"op_lvl": self.reward_scale * self.update_max_op_level() * 0.2,
-            #"dead": self.reward_scale * self.died_count * -0.1,
             "badge": self.reward_scale * self.get_badges() * 10,
             "explore": self.reward_scale * self.explore_weight * len(self.seen_coords) * 0.1,
-            "stuck": self.reward_scale * self.get_current_coord_count_reward() * -0.05
+            "pokedex": self.reward_scale * self.read_m(0xD30A) * 20,
+            "stuck": self.reward_scale * self.get_current_coord_count_reward() * -0.05,
+            "battle": self.reward_scale * (2 if in_battle else 0),
+            "win": self.reward_scale * self.battle_won_count * 50
         }
-
         return state_scores
 
     def update_max_op_level(self):
