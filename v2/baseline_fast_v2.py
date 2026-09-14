@@ -21,7 +21,12 @@ def parse_args():
     p.add_argument("--num-cpu", "--num_cpu", dest="num_cpu", type=int,
                    default=min(8, os.cpu_count() or 1),
                    help="Parallel environments (default: min(8, core count))")
-    p.add_argument("--ep-length", type=int, default=2048 * 80)
+    p.add_argument("--ep-length", type=int, default=2048 * 80,
+                   help="Episode truncation length (max_steps), in agent steps")
+    p.add_argument("--n-steps", type=int, default=1024,
+                   help="PPO rollout length per env — independent of episode length")
+    p.add_argument("--save-freq", type=int, default=50_000,
+                   help="Checkpoint every N per-env steps")
     p.add_argument("--sess-id", default="runs")
     p.add_argument("--rom", default="../PokemonRed.gb")
     p.add_argument("--init-state", default="../init.state")
@@ -120,7 +125,7 @@ def main():
     bootstrap_init_state(env_config)
 
     num_cpu = max(1, args.num_cpu)
-    n_steps = max(args.ep_length // num_cpu, 1)
+    n_steps = max(args.n_steps, 1)
     rollout = n_steps * num_cpu
     batch_size = args.batch_size
     if rollout % batch_size:
@@ -140,7 +145,7 @@ def main():
 
     # CheckpointCallback counts vec-env steps, not agent timesteps
     checkpoint_callback = CheckpointCallback(
-        save_freq=max(args.ep_length // (2 * num_cpu), 1),
+        save_freq=max(args.save_freq, 1),
         save_path=str(sess_path / "checkpoints"),
         name_prefix="poke",
     )

@@ -9,6 +9,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 
 from red_gym_env_v2 import RedGymEnv
 
+import io, os, threading, urllib.request, json
+from PIL import Image
+
+WEBHOOK = os.environ.get("POKE_WEBHOOK_URL")
 
 def latest_checkpoint(sess_path: Path) -> Path | None:
     zips = list((sess_path / "checkpoints").glob("*.zip"))
@@ -67,6 +71,10 @@ def main():
             action, _ = model.predict(obs, deterministic=args.deterministic)
             obs, _, _, _ = venv.step(action)   # VecEnv auto-resets on done
             step += 1
+            # uncomment these lines to send frames to webhook
+            #if args.post_every and step % args.post_every == 0:
+            #    base = venv.unwrapped.envs[0].unwrapped
+            #    post_frame(base, step, base.total_reward)
             if args.reload_every and step % args.reload_every == 0:
                 newest = latest_checkpoint(sess_path)
                 if newest and newest != ckpt:
@@ -77,6 +85,37 @@ def main():
         pass
     finally:
         venv.close()
+
+def post_frame(env, step, reward):
+    """Fire-and-forget PNG upload. Never blocks the emulator loop."""
+    if not WEBHOOK:
+        return
+    frame = env.render()                     # (144,160,3) uint8 RGB
+    img = Image.fromarray(frame).resize((480, 432), Image.NEAREST)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    payload = buf.getvalue()
+
+    def _send():
+        try:
+            # Discord/Slack multipart form upload
+            boundary = "----pokeframe"
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="content"\r\n\r\n'
+                f"step {step} | reward {reward:.1f}\r\n"
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="f.png"\r\n'
+                f"Content-Type: image/png\r\n\r\n"
+            ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                WEBHOOK, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as exc:
+            print(f"\nwebhook failed: {exc}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 if __name__ == "__main__":
