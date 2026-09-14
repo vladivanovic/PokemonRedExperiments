@@ -122,50 +122,50 @@ class RedGymEnv(Env):
             self.pyboy.set_emulation_speed(6)
 
     def reset(self, seed=None, options={}):
-        self.seed = seed
-        # restart game, skipping credits
-        with open(self.init_state, "rb") as f:
-            self.pyboy.load_state(f)
+        try:
+            self.seed = seed
+            # restart game, skipping credits
+            # with open(self.init_state, "rb") as f:
+            #     self.pyboy.load_state(f)
 
-        self.init_map_mem()
+            self.init_map_mem()
+            self.agent_stats = []
+            self.explore_map_dim = GLOBAL_MAP_SHAPE
+            self.explore_map = np.zeros(self.explore_map_dim, dtype=np.uint8)
+            self.recent_screens = np.zeros(self.output_shape, dtype=np.uint8)
+            self.recent_actions = np.zeros((self.frame_stacks,), dtype=np.uint8)
 
-        self.agent_stats = []
+            self.levels_satisfied = False
+            self.base_explore = 0
+            self.max_opponent_level = 0
+            self.max_event_rew = 0
+            self.max_level_rew = 0
+            self.last_health = 1
+            self.total_healing_rew = 0
+            self.died_count = 0
+            self.party_size = 0
+            self.step_count = 0
+            self.last_in_battle = False
+            self.battle_won_count = 0
 
-        self.explore_map_dim = GLOBAL_MAP_SHAPE
-        self.explore_map = np.zeros(self.explore_map_dim, dtype=np.uint8)
-
-        self.recent_screens = np.zeros( self.output_shape, dtype=np.uint8)
-        
-        self.recent_actions = np.zeros((self.frame_stacks,), dtype=np.uint8)
-
-        self.levels_satisfied = False
-        self.base_explore = 0
-        self.max_opponent_level = 0
-        self.max_event_rew = 0
-        self.max_level_rew = 0
-        self.last_health = 1
-        self.total_healing_rew = 0
-        self.died_count = 0
-        self.party_size = 0
-        self.step_count = 0
-        self.last_in_battle = False
-        self.battle_won_count = 0
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            self.base_event_flags = sum([
+                self.bit_count(self.read_m(i))
+                for i in range(event_flags_start, event_flags_end)
+            ])
+            self.current_event_flags_set = {}
+            self.max_map_progress = 0
+            self.progress_reward = self.get_game_state_reward()
+            self.total_reward = sum([val for _, val in self.progress_reward.items()])
+            self.reset_count += 1
+            
+            obs = self._get_obs()
+            if obs is None:
+                print("DEBUG: _get_obs returned None!")
+                return {}, {}
+            return obs, {}
+        except Exception as e:
+            print(f"DEBUG: Exception in reset: {e}")
+            raise e
 
     def init_map_mem(self):
         self.seen_coords = {}
