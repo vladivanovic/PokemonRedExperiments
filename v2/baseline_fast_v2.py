@@ -107,7 +107,7 @@ def main():
         "reward_scale": 0.5,
         "explore_weight": 1.0,
         "debug_events": False,
-        "stuck_threshold": 5000,
+        "stuck_threshold": 1200,
     }
 
     if not Path(args.rom).exists():
