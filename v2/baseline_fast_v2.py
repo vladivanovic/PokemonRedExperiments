@@ -105,7 +105,7 @@ def main():
         "session_path": sess_path,
         "gb_path": args.rom,
         "reward_scale": 0.5,
-        "explore_weight": 0.25,
+        "explore_weight": 1.0,
         "debug_events": False,
         "stuck_threshold": 5000,
     }

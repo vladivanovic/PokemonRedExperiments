@@ -193,6 +193,7 @@ class RedGymEnv(Env):
         self.total_reward = 0.0
         self.last_step_reward = 0.0
         self._faint_steps = 0
+        self.skip_next_heal = False
 
     def init_map_mem(self):
         self.seen_coords = {}
@@ -497,12 +498,15 @@ class RedGymEnv(Env):
         cur_health = self.read_hp_fraction()
         party_unchanged = self.read_m(PARTY_COUNT) == self.party_size
 
-        if (self.last_health > 0 and cur_health <= 0 and self.party_max_hp_sum() > 0):
+        if (self.last_health > 0 and cur_health <= 0
+                and self.party_max_hp_sum() > 0):
             self.died_count += 1
-        elif cur_health > self.last_health and party_unchanged and self.last_health > 0:
-            # linear in the fraction healed; the old version squared this,
-            # which made realistic heals nearly worthless
-            self.total_healing_rew += cur_health - self.last_health
+            self.skip_next_heal = True      # the blackout auto-heal
+        elif cur_health > self.last_health and party_unchanged:
+            if self.skip_next_heal:
+                self.skip_next_heal = False
+            else:
+                self.total_healing_rew += cur_health - self.last_health
 
     def party_max_hp_sum(self):
         return sum(self.read_hp(a) for a in PARTY_MAX_HP)
@@ -567,8 +571,9 @@ class RedGymEnv(Env):
                         * len(self.seen_coords) * 0.1),
             "pokedex": self.reward_scale * self.get_pokedex_owned() * 2,
             "battle": self.reward_scale * self.battles_entered * 0.5,
-            "win": self.reward_scale * self.battle_won_count * 50,
+            "win": self.reward_scale * self.battle_won_count * 5,
             "party": self.reward_scale * self.read_m(PARTY_COUNT) * 10,
+            "map_progress": self.reward_scale * self.max_map_progress * 20,
         }
 
     def get_instantaneous_reward(self):
