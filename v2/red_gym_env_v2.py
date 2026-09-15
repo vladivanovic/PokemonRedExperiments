@@ -71,6 +71,7 @@ class RedGymEnv(Env):
         self.fast_video = bool(config.get("fast_video", True))
         self.explore_weight = float(config.get("explore_weight", 1.0))
         self.reward_scale = float(config.get("reward_scale", 1.0))
+        self.terminate_on_wipe = bool(config.get("reward_scale", 1.0))
         self.instance_id = str(config.get("instance_id", str(uuid.uuid4())[:8]))
         self.render_mode = render_mode
 
@@ -518,6 +519,8 @@ class RedGymEnv(Env):
         nonzero while max-HP is still 0. Requiring valid max-HP plus a few
         consecutive zero-HP steps avoids firing on that write window.
         """
+        if not self.terminate_on_wipe:
+            return False        # blackout auto-heals and respawns; let it play out
         if self.party_size == 0 or self.party_max_hp_sum() == 0:
             self._faint_steps = 0
             return False
