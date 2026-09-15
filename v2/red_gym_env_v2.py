@@ -36,6 +36,7 @@ BADGES = 0xD356
 POKEDEX_OWNED = (0xD2F7, 0xD30A)  # 19 bytes of owned flags
 X_POS, Y_POS, MAP_N = 0xD362, 0xD361, 0xD35E
 REDS_HOUSE_2F = 38                # map id the game starts on
+TEXTBOX_ID = 0xD125
 
 # built-in on 3.10+; user is on 3.12
 def popcount(v: int) -> int:
@@ -443,7 +444,7 @@ class RedGymEnv(Env):
         return repeat(out, "h w -> (h h2) (w w2)", h2=2, w2=2)
 
     def update_seen_coords(self):
-        if self.read_m(IN_BATTLE) != 0:
+        if self.read_m(IN_BATTLE) != 0 or self.read_m(TEXTBOX_ID) != 0:
             return
         x_pos, y_pos, map_n = self.get_game_coords()
         key = f"x:{x_pos} y:{y_pos} m:{map_n}"
@@ -550,6 +551,7 @@ class RedGymEnv(Env):
             "pokedex": self.reward_scale * self.get_pokedex_owned() * 2,
             "battle": self.reward_scale * self.battles_entered * 0.5,
             "win": self.reward_scale * self.battle_won_count * 50,
+            "party": self.reward_scale * self.read_m(PARTY_COUNT) * 10,
         }
 
     def get_instantaneous_reward(self):
