@@ -71,7 +71,7 @@ class RedGymEnv(Env):
         self.fast_video = bool(config.get("fast_video", True))
         self.explore_weight = float(config.get("explore_weight", 1.0))
         self.reward_scale = float(config.get("reward_scale", 1.0))
-        self.terminate_on_wipe = bool(config.get("reward_scale", 1.0))
+        self.terminate_on_wipe = bool(config.get("terminate_on_wipe", False))
         self.instance_id = str(config.get("instance_id", str(uuid.uuid4())[:8]))
         self.render_mode = render_mode
 
@@ -305,6 +305,13 @@ class RedGymEnv(Env):
         self.save_and_print_info(terminated or truncated, obs)
         if terminated or truncated:
             self._close_video()
+
+        if terminated or truncated:
+            print(f"\n[DONE] term={terminated} trunc={truncated} "
+                  f"step={self.step_count} party={self.party_size} "
+                  f"hp={self.read_hp_fraction():.3f} "
+                  f"maxhp={self.party_max_hp_sum()} "
+                  f"twipe={self.terminate_on_wipe}", flush=True)
 
         return obs, reward, terminated, truncated, {}
 
@@ -568,7 +575,7 @@ class RedGymEnv(Env):
         return {
             "event": self.reward_scale * self.update_max_event_rew() * 4,
             "level": self.reward_scale * self.get_levels_reward() * 2,
-            "heal": self.reward_scale * self.total_healing_rew * 10,
+            "heal": self.reward_scale * self.total_healing_rew * 40,
             "badge": self.reward_scale * self.get_badges() * 10,
             "explore": (self.reward_scale * self.explore_weight
                         * len(self.seen_coords) * 0.1),
