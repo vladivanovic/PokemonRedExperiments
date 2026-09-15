@@ -192,6 +192,7 @@ class RedGymEnv(Env):
         self.progress_reward = {}
         self.total_reward = 0.0
         self.last_step_reward = 0.0
+        self._faint_steps = 0
 
     def init_map_mem(self):
         self.seen_coords = {}
@@ -496,15 +497,31 @@ class RedGymEnv(Env):
         cur_health = self.read_hp_fraction()
         party_unchanged = self.read_m(PARTY_COUNT) == self.party_size
 
-        if self.last_health > 0 and cur_health <= 0:
+        if (self.last_health > 0 and cur_health <= 0 and self.party_max_hp_sum() > 0):
             self.died_count += 1
         elif cur_health > self.last_health and party_unchanged and self.last_health > 0:
             # linear in the fraction healed; the old version squared this,
             # which made realistic heals nearly worthless
             self.total_healing_rew += cur_health - self.last_health
 
+    def party_max_hp_sum(self):
+        return sum(self.read_hp(a) for a in PARTY_MAX_HP)
+
     def check_terminated(self):
-        return self.party_size > 0 and self.read_hp_fraction() <= 0.0
+        """True only on a confirmed party wipe.
+
+        The party struct is written over several frames, so wPartyCount can be
+        nonzero while max-HP is still 0. Requiring valid max-HP plus a few
+        consecutive zero-HP steps avoids firing on that write window.
+        """
+        if self.party_size == 0 or self.party_max_hp_sum() == 0:
+            self._faint_steps = 0
+            return False
+        if self.read_hp_fraction() > 0.0:
+            self._faint_steps = 0
+            return False
+        self._faint_steps += 1
+        return self._faint_steps >= 4
 
     # -------------------------------------------------------------- rewards
     def get_levels_sum(self):
