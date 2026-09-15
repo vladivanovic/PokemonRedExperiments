@@ -580,7 +580,7 @@ class RedGymEnv(Env):
             "explore": (self.reward_scale * self.explore_weight
                         * len(self.seen_coords) * 0.1),
             "pokedex": self.reward_scale * self.get_pokedex_owned() * 2,
-            "battle": self.reward_scale * self.battles_entered * 0.5,
+            "battle": 0.0 * self.battles_entered,
             "win": self.reward_scale * self.battle_won_count * 5,
             "party": self.reward_scale * self.read_m(PARTY_COUNT) * 10,
             "map_progress": self.reward_scale * self.max_map_progress * 20,
