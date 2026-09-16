@@ -36,7 +36,6 @@ BADGES = 0xD356
 POKEDEX_OWNED = (0xD2F7, 0xD30A)  # 19 bytes of owned flags
 X_POS, Y_POS, MAP_N = 0xD362, 0xD361, 0xD35E
 REDS_HOUSE_2F = 38                # map id the game starts on
-TEXTBOX_ID = 0xD125
 
 # built-in on 3.10+; user is on 3.12
 def popcount(v: int) -> int:
@@ -458,8 +457,6 @@ class RedGymEnv(Env):
             return
         x_pos, y_pos, map_n = self.get_game_coords()
         key = f"x:{x_pos} y:{y_pos} m:{map_n}"
-        if self.read_m(TEXTBOX_ID) != 0 and key not in self.seen_coords:
-            return          # don't credit a new tile mid-dialogue
         self.seen_coords[key] = self.seen_coords.get(key, 0) + 1
 
     def get_current_coord_count_reward(self):
