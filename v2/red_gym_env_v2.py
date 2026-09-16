@@ -454,10 +454,12 @@ class RedGymEnv(Env):
         return repeat(out, "h w -> (h h2) (w w2)", h2=2, w2=2)
 
     def update_seen_coords(self):
-        if self.read_m(IN_BATTLE) != 0 or self.read_m(TEXTBOX_ID) != 0:
+        if self.read_m(IN_BATTLE) != 0:
             return
         x_pos, y_pos, map_n = self.get_game_coords()
         key = f"x:{x_pos} y:{y_pos} m:{map_n}"
+        if self.read_m(TEXTBOX_ID) != 0 and key not in self.seen_coords:
+            return          # don't credit a new tile mid-dialogue
         self.seen_coords[key] = self.seen_coords.get(key, 0) + 1
 
     def get_current_coord_count_reward(self):

@@ -173,7 +173,7 @@ def main():
         model = PPO(
             "MultiInputPolicy", env, verbose=1, device=args.device,
             n_steps=n_steps, batch_size=batch_size, n_epochs=args.n_epochs,
-            gamma=0.997, ent_coef=0.01, seed=args.seed,
+            gamma=0.997, ent_coef=0.05, seed=args.seed,
             tensorboard_log=str(sess_path),
         )
 
