@@ -544,7 +544,7 @@ class RedGymEnv(Env):
         return max(sum(poke_levels) - starter_additional_levels, 0)
 
     def get_levels_reward(self):
-        explore_thresh, scale_factor = 22, 4
+        explore_thresh, scale_factor = 12, 8
         level_sum = self.get_levels_sum()
         scaled = (level_sum if level_sum < explore_thresh
                   else (level_sum - explore_thresh) / scale_factor + explore_thresh)
@@ -580,9 +580,9 @@ class RedGymEnv(Env):
                         * len(self.seen_coords) * 0.1),
             "pokedex": self.reward_scale * self.get_pokedex_owned() * 2,
             "battle": 0.0 * self.battles_entered,
-            "win": self.reward_scale * self.battle_won_count * 5,
+            "win": self.reward_scale * (self.battle_won_count ** 0.5) * 8,
             "party": self.reward_scale * self.read_m(PARTY_COUNT) * 10,
-            "map_progress": self.reward_scale * self.max_map_progress * 20,
+            "map_progress": self.reward_scale * self.max_map_progress * 100,
         }
 
     def get_instantaneous_reward(self):
